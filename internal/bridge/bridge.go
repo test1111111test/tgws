@@ -5,17 +5,25 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"sync"
 	"time"
 
 	"tgws/internal/crypto"
-	"tgws/internal/websocket"
 )
 
+// ClientConn интерфейс для клиентского соединения
+// Реализуется как net.Conn (обычный режим), так и *fake_tls.FakeTlsStream (Fake TLS режим)
+type ClientConn interface {
+	io.Reader
+	io.Writer
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	Close() error
+}
+
 type Bridge struct {
-	clientConn net.Conn
-	ws         *websocket.Client
+	clientConn ClientConn
+	ws         Transport
 	ctx        *crypto.CryptoContext
 	splitter   *MsgSplitter
 
@@ -25,7 +33,7 @@ type Bridge struct {
 	firstUpLogged, firstDownLogged             bool
 }
 
-func NewBridge(cc net.Conn, ws *websocket.Client, ctx *crypto.CryptoContext,
+func NewBridge(cc ClientConn, ws Transport, ctx *crypto.CryptoContext,
 	splitter *MsgSplitter, label string, dc int, isMedia bool) *Bridge {
 	dt := fmt.Sprintf("DC%d", dc)
 	if isMedia {
@@ -80,7 +88,7 @@ func (b *Bridge) tcpToWS(ctx context.Context) error {
 		n, err := b.clientConn.Read(buf)
 		if err != nil {
 			if err == io.EOF {
-				log.Printf("[%s] ⚠ CLIENT closed TCP connection (EOF)", b.label)
+				log.Printf("[%s] ⚠ CLIENT closed connection (EOF)", b.label)
 				if b.splitter != nil {
 					if t := b.splitter.Flush(); len(t) > 0 {
 						for _, p := range t {
@@ -151,10 +159,10 @@ func (b *Bridge) wsToTCP(ctx context.Context) error {
 		data, err := b.ws.Recv()
 		if err != nil {
 			if err == io.EOF {
-				log.Printf("[%s] ⚠ DC closed WS connection (EOF)", b.label)
+				log.Printf("[%s] ⚠ DC closed connection (EOF)", b.label)
 				return nil
 			}
-			log.Printf("[%s] ⚠ DC WS recv error: %v", b.label, err)
+			log.Printf("[%s] ⚠ DC recv error: %v", b.label, err)
 			return err
 		}
 
@@ -163,7 +171,7 @@ func (b *Bridge) wsToTCP(ctx context.Context) error {
 
 		if !b.firstDownLogged {
 			b.firstDownLogged = true
-			log.Printf("[%s] ↓ FIRST from WS: %d bytes, head=%x",
+			log.Printf("[%s] ↓ FIRST from DC: %d bytes, head=%x",
 				b.label, len(data), head(data, 32))
 		}
 

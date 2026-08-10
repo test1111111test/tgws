@@ -7,8 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"log"
-	"sync/atomic"
 )
 
 type MTProtoCipher struct {
@@ -48,7 +46,6 @@ type HandshakeResult struct {
 	ProtoTag          []byte
 	ProtoInt          uint32
 	ClientDecPrekeyIV []byte
-	ClientDec         *MTProtoCipher
 }
 
 func TryHandshake(handshake, secret []byte) (*HandshakeResult, error) {
@@ -96,13 +93,14 @@ func TryHandshake(handshake, secret []byte) (*HandshakeResult, error) {
 		protoInt = ProtoPaddedIntermediateInt
 	}
 
+	// ИСПРАВЛЕНО: НЕ возвращаем использованный decryptor
+	// Caller должен создать новый CltDec из ClientDecPrekeyIV
 	return &HandshakeResult{
 		DC:                dcID,
 		IsMedia:           isMedia,
 		ProtoTag:          protoTag,
 		ProtoInt:          protoInt,
 		ClientDecPrekeyIV: decPrekeyIV,
-		ClientDec:         decryptor,
 	}, nil
 }
 
@@ -155,63 +153,63 @@ func GenerateRelayInit(protoTag []byte, dcIdx int) ([]byte, error) {
 
 type CryptoContext struct {
 	CltDec, CltEnc, TGEnc, TGDec *MTProtoCipher
-	Mode                         int
 }
 
-// Глобальный счётчик для чередования режимов
-var modeCounter uint64
+// ИСПРАВЛЕНО: Упрощённая версия без экспериментальных режимов
+// Строит контекст по стандартному алгоритму оригинального Python кода
+func BuildCryptoContext(clientDecPrekeyIV, secret, relayInit []byte) (*CryptoContext, error) {
+	// Client decryption: SHA256(prekey + secret), IV from handshake
+	cltDecPrekey := clientDecPrekeyIV[:PrekeyLen]
+	cltDecIV := clientDecPrekeyIV[PrekeyLen:]
+	cltDecKeyInput := make([]byte, len(cltDecPrekey)+len(secret))
+	copy(cltDecKeyInput, cltDecPrekey)
+	copy(cltDecKeyInput[len(cltDecPrekey):], secret)
+	cltDecKey := sha256.Sum256(cltDecKeyInput)
 
-// NextMode возвращает следующий режим для перебора
-func NextMode() int {
-	return int(atomic.AddUint64(&modeCounter, 1) % 4)
-}
+	cltDec, err := NewMTProtoCipher(cltDecKey[:], cltDecIV)
+	if err != nil {
+		return nil, fmt.Errorf("clt_dec: %w", err)
+	}
+	// Fast-forward через 64 байта init packet
+	cltDec.FastForward(HandshakeLen)
 
-// BuildCryptoContext создаёт контекст с указанным режимом clt_enc
-// mode 0: reversed,  без fast-forward  (стандарт)
-// mode 1: reversed,  fast-forward 64
-// mode 2: non-rev,   без fast-forward
-// mode 3: non-rev,   fast-forward 64
-func BuildCryptoContext(clientDec *MTProtoCipher, clientDecPrekeyIV, secret, relayInit []byte, mode int) (*CryptoContext, error) {
-	cltDec := clientDec
+	// Client encryption: REVERSED prekey+iv, SHA256(rev_prekey + secret)
+	cltEncPrekeyIV := reverseBytes(clientDecPrekeyIV)
+	cltEncPrekey := cltEncPrekeyIV[:PrekeyLen]
+	cltEncIV := cltEncPrekeyIV[PrekeyLen:]
+	cltEncKeyInput := make([]byte, len(cltEncPrekey)+len(secret))
+	copy(cltEncKeyInput, cltEncPrekey)
+	copy(cltEncKeyInput[len(cltEncPrekey):], secret)
+	cltEncKey := sha256.Sum256(cltEncKeyInput)
 
-	var cltEncKey [32]byte
-	var cltEncIV []byte
-
-	if mode == 0 || mode == 1 {
-		// reversed
-		rev := reverseBytes(clientDecPrekeyIV)
-		prekey := rev[:PrekeyLen]
-		cltEncIV = rev[PrekeyLen:]
-		cltEncKey = sha256.Sum256(append(prekey, secret...))
-	} else {
-		// non-reversed (как clt_dec)
-		prekey := clientDecPrekeyIV[:PrekeyLen]
-		cltEncIV = clientDecPrekeyIV[PrekeyLen:]
-		cltEncKey = sha256.Sum256(append(prekey, secret...))
+	cltEnc, err := NewMTProtoCipher(cltEncKey[:], cltEncIV)
+	if err != nil {
+		return nil, fmt.Errorf("clt_enc: %w", err)
 	}
 
-	cltEnc, _ := NewMTProtoCipher(cltEncKey[:], cltEncIV)
-	if mode == 1 || mode == 3 {
-		cltEnc.FastForward(HandshakeLen)
-	}
-
-	log.Printf("DEBUG clt_enc mode=%d key[0:8]=%x iv=%x", mode, cltEncKey[:8], cltEncIV)
-
-	// TGEnc
+	// Telegram encryption: RAW key from relay_init (БЕЗ secret!)
 	tgEncKey := relayInit[SkipLen : SkipLen+PrekeyLen]
 	tgEncIV := relayInit[SkipLen+PrekeyLen : SkipLen+PrekeyLen+IVLen]
-	tgEnc, _ := NewMTProtoCipher(tgEncKey, tgEncIV)
+	tgEnc, err := NewMTProtoCipher(tgEncKey, tgEncIV)
+	if err != nil {
+		return nil, fmt.Errorf("tg_enc: %w", err)
+	}
 	tgEnc.FastForward(HandshakeLen)
 
-	// TGDec
+	// Telegram decryption: REVERSED key from relay_init
 	tgDecPrekeyIV := reverseBytes(relayInit[SkipLen : SkipLen+PrekeyLen+IVLen])
 	tgDecKey := tgDecPrekeyIV[:KeyLen]
 	tgDecIV := tgDecPrekeyIV[KeyLen:]
-	tgDec, _ := NewMTProtoCipher(tgDecKey, tgDecIV)
+	tgDec, err := NewMTProtoCipher(tgDecKey, tgDecIV)
+	if err != nil {
+		return nil, fmt.Errorf("tg_dec: %w", err)
+	}
 
 	return &CryptoContext{
-		CltDec: cltDec, CltEnc: cltEnc, TGEnc: tgEnc, TGDec: tgDec,
-		Mode: mode,
+		CltDec: cltDec,
+		CltEnc: cltEnc,
+		TGEnc:  tgEnc,
+		TGDec:  tgDec,
 	}, nil
 }
 

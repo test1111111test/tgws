@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -13,13 +14,19 @@ import (
 )
 
 type Config struct {
-	Host        string
-	Port        int
-	Secret      string
-	BufferSize  int
-	PoolSize    int
-	DCRedirects map[int]string
-	ForceTestDC bool
+	Host          string
+	Port          int
+	Secret        string
+	BufferSize    int
+	PoolSize      int
+	DCRedirects   map[int]string
+	ForceTestDC   bool
+	MaskDomain    string
+	FakeTLSDomain string
+	LogFile       string // путь к файлу логов (пусто = только консоль)
+	LogMaxSize    int    // макс размер файла в MB
+	LogMaxFiles   int    // количество старых файлов
+	LogToConsole  bool   // выводить ли логи в консоль
 }
 
 func DefaultConfig() *Config {
@@ -36,8 +43,27 @@ func DefaultConfig() *Config {
 			2: "149.154.167.51",
 			4: "149.154.167.91",
 		},
-		ForceTestDC: false,
+		ForceTestDC:   false,
+		MaskDomain:    "www.google.com",
+		FakeTLSDomain: "",
+		LogFile:       "",   // по умолчанию только консоль
+		LogMaxSize:    10,   // 10 MB
+		LogMaxFiles:   5,    // хранить 5 файлов
+		LogToConsole:  true, // выводить в консоль
 	}
+}
+
+func (c *Config) GenerateSecret() {
+	secret := make([]byte, 16)
+	rand.Read(secret)
+	c.Secret = hex.EncodeToString(secret)
+}
+
+func (c *Config) EESecret() string {
+	if c.FakeTLSDomain == "" {
+		return ""
+	}
+	return "ee" + c.Secret + hex.EncodeToString([]byte(c.FakeTLSDomain))
 }
 
 func (c *Config) LoadFromFile(filename string) error {
@@ -46,6 +72,18 @@ func (c *Config) LoadFromFile(filename string) error {
 		return fmt.Errorf("open config file: %w", err)
 	}
 	defer file.Close()
+
+	// Пропускаем UTF-8 BOM если есть
+	bom := make([]byte, 3)
+	n, err := file.Read(bom)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("read BOM: %w", err)
+	}
+	if n < 3 || bom[0] != 0xEF || bom[1] != 0xBB || bom[2] != 0xBF {
+		if _, err := file.Seek(0, 0); err != nil {
+			return fmt.Errorf("seek: %w", err)
+		}
+	}
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
@@ -118,6 +156,26 @@ func (c *Config) setValue(key, value string) error {
 		if value != "" {
 			c.DCRedirects = parseDCIPs(value)
 		}
+	case "mask_domain":
+		c.MaskDomain = value
+	case "fake_tls_domain":
+		c.FakeTLSDomain = value
+	case "log_file":
+		c.LogFile = value
+	case "log_max_size":
+		size, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid log_max_size: %s", value)
+		}
+		c.LogMaxSize = size
+	case "log_max_files":
+		files, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid log_max_files: %s", value)
+		}
+		c.LogMaxFiles = files
+	case "log_to_console":
+		c.LogToConsole = parseBool(value)
 	default:
 		return fmt.Errorf("unknown parameter: %s", key)
 	}
@@ -150,6 +208,29 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString("# Принудительно использовать тестовые DC\n")
 	sb.WriteString(fmt.Sprintf("force_test_dc = %v\n\n", c.ForceTestDC))
 
+	sb.WriteString("# Домен для маскировки HTTP трафика\n")
+	sb.WriteString(fmt.Sprintf("mask_domain = %s\n\n", c.MaskDomain))
+
+	sb.WriteString("# Домен для Fake TLS (ee-secret)\n")
+	sb.WriteString(fmt.Sprintf("fake_tls_domain = %s\n\n", c.FakeTLSDomain))
+
+	sb.WriteString("# ========================================\n")
+	sb.WriteString("# Логирование\n")
+	sb.WriteString("# ========================================\n\n")
+
+	sb.WriteString("# Путь к файлу логов (пусто = только консоль)\n")
+	sb.WriteString("# Пример: log_file = tgws.log\n")
+	sb.WriteString(fmt.Sprintf("log_file = %s\n\n", c.LogFile))
+
+	sb.WriteString("# Максимальный размер файла логов в мегабайтах\n")
+	sb.WriteString(fmt.Sprintf("log_max_size = %d\n\n", c.LogMaxSize))
+
+	sb.WriteString("# Количество старых файлов логов для хранения\n")
+	sb.WriteString(fmt.Sprintf("log_max_files = %d\n\n", c.LogMaxFiles))
+
+	sb.WriteString("# Выводить ли логи в консоль\n")
+	sb.WriteString(fmt.Sprintf("log_to_console = %v\n\n", c.LogToConsole))
+
 	sb.WriteString("# Редиректы DC (формат: DC:IP,DC:IP)\n")
 	sb.WriteString(fmt.Sprintf("dc_ip = %s\n", formatDCIPs(c.DCRedirects)))
 
@@ -167,6 +248,11 @@ func ParseFlags() *Config {
 	poolSize := flag.Int("pool", 0, "WebSocket pool size (override config.ini)")
 	forceTestDC := flag.Bool("test-dc", false, "Force test DC mode (override config.ini)")
 	dcIPs := flag.String("dc-ip", "", "DC redirects (override config.ini)")
+	maskDomain := flag.String("mask-domain", "", "Mask domain for HTTP traffic (override config.ini)")
+	fakeTLSDomain := flag.String("fake-tls-domain", "", "Fake TLS domain for ee-secret (override config.ini)")
+	logFile := flag.String("log-file", "", "Log file path (override config.ini)")
+	logMaxSize := flag.Int("log-max-size", 0, "Max log file size in MB (override config.ini)")
+	logMaxFiles := flag.Int("log-max-files", 0, "Max old log files to keep (override config.ini)")
 
 	flag.Parse()
 
@@ -199,13 +285,48 @@ func ParseFlags() *Config {
 	if *dcIPs != "" {
 		cfg.DCRedirects = parseDCIPs(*dcIPs)
 	}
+	if *maskDomain != "" {
+		cfg.MaskDomain = *maskDomain
+	}
+	if *fakeTLSDomain != "" {
+		cfg.FakeTLSDomain = *fakeTLSDomain
+	}
+	if *logFile != "" {
+		cfg.LogFile = *logFile
+	}
+	if *logMaxSize != 0 {
+		cfg.LogMaxSize = *logMaxSize
+	}
+	if *logMaxFiles != 0 {
+		cfg.LogMaxFiles = *logMaxFiles
+	}
 
 	return cfg
 }
 
-func parseBool(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return s == "true" || s == "1" || s == "yes" || s == "on"
+func (c *Config) Validate() error {
+	if c.Port < 1 || c.Port > 65535 {
+		return fmt.Errorf("invalid port: %d", c.Port)
+	}
+	if len(c.Secret) != 32 {
+		return fmt.Errorf("secret must be 32 hex characters, got %d", len(c.Secret))
+	}
+	if c.BufferSize < 4096 {
+		return fmt.Errorf("buffer_size too small: %d", c.BufferSize)
+	}
+	if c.PoolSize < 0 {
+		return fmt.Errorf("pool_size cannot be negative: %d", c.PoolSize)
+	}
+	if c.MaskDomain == "" {
+		return fmt.Errorf("mask_domain cannot be empty")
+	}
+	if c.LogMaxSize < 1 {
+		return fmt.Errorf("log_max_size must be at least 1 MB")
+	}
+	if c.LogMaxFiles < 1 {
+		return fmt.Errorf("log_max_files must be at least 1")
+	}
+	return nil
 }
 
 func parseDCIPs(s string) map[int]string {
@@ -217,12 +338,10 @@ func parseDCIPs(s string) map[int]string {
 		}
 		kv := strings.SplitN(part, ":", 2)
 		if len(kv) != 2 {
-			log.Printf("Invalid DC:IP format: %s", part)
 			continue
 		}
 		dc, err := strconv.Atoi(strings.TrimSpace(kv[0]))
 		if err != nil {
-			log.Printf("Invalid DC number: %s", kv[0])
 			continue
 		}
 		result[dc] = strings.TrimSpace(kv[1])
@@ -231,44 +350,14 @@ func parseDCIPs(s string) map[int]string {
 }
 
 func formatDCIPs(m map[int]string) string {
-	if len(m) == 0 {
-		return ""
-	}
-	var parts []string
-	for dc := 1; dc <= 203; dc++ {
-		if ip, ok := m[dc]; ok {
-			parts = append(parts, fmt.Sprintf("%d:%s", dc, ip))
-		}
+	parts := make([]string, 0, len(m))
+	for dc, ip := range m {
+		parts = append(parts, fmt.Sprintf("%d:%s", dc, ip))
 	}
 	return strings.Join(parts, ",")
 }
 
-func (c *Config) Validate() error {
-	if c.Port < 1 || c.Port > 65535 {
-		return fmt.Errorf("invalid port: %d", c.Port)
-	}
-	if len(c.Secret) != 32 {
-		return fmt.Errorf("secret must be 32 hex characters, got %d", len(c.Secret))
-	}
-	if _, err := hex.DecodeString(c.Secret); err != nil {
-		return fmt.Errorf("invalid secret hex: %w", err)
-	}
-	if c.BufferSize < 4096 {
-		return fmt.Errorf("buffer_size too small: %d", c.BufferSize)
-	}
-	if c.PoolSize < 0 {
-		return fmt.Errorf("pool_size cannot be negative: %d", c.PoolSize)
-	}
-	return nil
-}
-
-func (c *Config) GenerateSecret() {
-	secret := make([]byte, 16)
-	rand.Read(secret)
-	c.Secret = hex.EncodeToString(secret)
-}
-
-func (c *Config) String() string {
-	return fmt.Sprintf("host=%s port=%d buffer=%d pool=%d test_dc=%v",
-		c.Host, c.Port, c.BufferSize, c.PoolSize, c.ForceTestDC)
+func parseBool(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "true" || s == "1" || s == "yes" || s == "on"
 }

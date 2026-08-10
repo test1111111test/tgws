@@ -9,12 +9,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
 const (
+	OpText   = 0x1
 	OpBinary = 0x2
 	OpClose  = 0x8
 	OpPing   = 0x9
@@ -36,35 +39,26 @@ type HandshakeError struct {
 }
 
 func (e *HandshakeError) Error() string {
-	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.StatusLine)
+	return fmt.Sprintf("HTTP %d: %s (Location: %s)", e.StatusCode, e.StatusLine, e.Location)
 }
-func (e *HandshakeError) IsRedirect() bool { return e.StatusCode >= 300 && e.StatusCode < 400 }
 
-// Все известные WebSocket paths Telegram
-var AllPaths = []string{
-	"/apiws",
-	"/apiws_test",
-	"/apiws_prod",
-	"/apiws_test_prod",
-	"/apiws_testv2",
-	"/apiws_testv3",
-	"/apiws_prodv2",
-	"/apiws_prodv3",
-	"/apiws_v2",
-	"/apiws_v3",
+func (e *HandshakeError) IsRedirect() bool {
+	return e.StatusCode >= 300 && e.StatusCode < 400
 }
+
+var AllPaths = []string{"/apiws", "/apiws_test"}
 
 func ConnectDomain(ctx context.Context, domain, path string, timeout time.Duration) (*Client, error) {
 	if path == "" {
 		path = "/apiws"
 	}
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
+	if timeout < 10*time.Second {
+		timeout = 10 * time.Second
 	}
 
 	tlsConfig := &tls.Config{
 		ServerName:         domain,
-		InsecureSkipVerify: false,
+		InsecureSkipVerify: true,
 	}
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 
@@ -94,8 +88,8 @@ func Connect(ctx context.Context, host, domain, path string, timeout time.Durati
 	if path == "" {
 		path = "/apiws"
 	}
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
+	if timeout < 10*time.Second {
+		timeout = 10 * time.Second
 	}
 
 	tlsConfig := &tls.Config{
@@ -145,12 +139,11 @@ func setTCPOptions(conn net.Conn) {
 func (c *Client) handshake(path string, timeout time.Duration) error {
 	keyBytes := make([]byte, 16)
 	rand.Read(keyBytes)
+
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"+
 		"Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n"+
-		"Sec-WebSocket-Protocol: binary\r\n"+
-		"Origin: https://%s\r\n"+
-		"\r\n",
-		path, c.domain, base64.StdEncoding.EncodeToString(keyBytes), c.domain)
+		"Sec-WebSocket-Protocol: binary\r\n\r\n",
+		path, c.domain, base64.StdEncoding.EncodeToString(keyBytes))
 
 	c.conn.SetWriteDeadline(time.Now().Add(timeout))
 	if _, err := c.conn.Write([]byte(req)); err != nil {
@@ -168,11 +161,67 @@ func (c *Client) handshake(path string, timeout time.Duration) error {
 		return nil
 	}
 
+	// HTTP redirect - возвращаем Location
+	location := resp.Header.Get("Location")
 	return &HandshakeError{
 		StatusCode: resp.StatusCode,
 		StatusLine: resp.Status,
-		Location:   resp.Header.Get("Location"),
+		Location:   location,
 	}
+}
+
+// ConnectDomainWithRedirect следует за HTTP redirects (до 3 hops)
+func ConnectDomainWithRedirect(ctx context.Context, domain, path string, timeout time.Duration) (*Client, error) {
+	currentDomain := domain
+	currentPath := path
+
+	for i := 0; i < 3; i++ {
+		client, err := ConnectDomain(ctx, currentDomain, currentPath, timeout)
+		if err == nil {
+			return client, nil
+		}
+
+		// Проверяем, не redirect ли это
+		if hsErr, ok := err.(*HandshakeError); ok && hsErr.IsRedirect() && hsErr.Location != "" {
+			log.Printf("[%s] Following redirect: %s -> %s", currentDomain, currentPath, hsErr.Location)
+
+			// Парсим новый URL
+			newDomain, newPath, parseErr := parseRedirectURL(hsErr.Location)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse redirect: %w", parseErr)
+			}
+
+			currentDomain = newDomain
+			currentPath = newPath
+			continue
+		}
+
+		// Не redirect - возвращаем ошибку
+		return nil, err
+	}
+
+	return nil, fmt.Errorf("too many redirects")
+}
+
+// parseRedirectURL извлекает domain и path из redirect URL
+func parseRedirectURL(location string) (domain, path string, err error) {
+	// Простой парсер: убираем scheme и извлекаем host/path
+	location = strings.TrimPrefix(location, "https://")
+	location = strings.TrimPrefix(location, "http://")
+
+	parts := strings.SplitN(location, "/", 2)
+	if len(parts) == 0 {
+		return "", "", fmt.Errorf("invalid redirect URL: %s", location)
+	}
+
+	domain = parts[0]
+	if len(parts) == 2 {
+		path = "/" + parts[1]
+	} else {
+		path = "/"
+	}
+
+	return domain, path, nil
 }
 
 func (c *Client) Send(data []byte) error {
@@ -180,6 +229,13 @@ func (c *Client) Send(data []byte) error {
 		return fmt.Errorf("websocket closed")
 	}
 	return c.sendFrame(OpBinary, data, true)
+}
+
+func (c *Client) SendPing() error {
+	if c.closed {
+		return fmt.Errorf("websocket closed")
+	}
+	return c.sendFrame(OpPing, []byte("ping"), true)
 }
 
 func (c *Client) Recv() ([]byte, error) {
@@ -192,12 +248,17 @@ func (c *Client) Recv() ([]byte, error) {
 		switch opcode {
 		case OpClose:
 			c.closed = true
-			c.sendFrame(OpClose, nil, true)
+			_ = c.sendFrame(OpClose, nil, true)
 			return nil, io.EOF
 		case OpPing:
-			c.sendFrame(OpPong, payload, true)
+			_ = c.sendFrame(OpPong, payload, true)
+		case OpPong:
+			log.Printf("[WS] received pong")
+			continue
 		case OpBinary:
 			return payload, nil
+		case OpText:
+			log.Printf("[WS] received unexpected Text frame: %s", string(payload))
 		}
 	}
 	return nil, io.EOF
@@ -208,7 +269,7 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
-	c.sendFrame(OpClose, nil, true)
+	_ = c.sendFrame(OpClose, nil, true)
 	return c.conn.Close()
 }
 
@@ -240,10 +301,11 @@ func (c *Client) sendFrame(opcode byte, data []byte, mask bool) error {
 		data = masked
 	}
 
-	if _, err := c.conn.Write(header); err != nil {
-		return err
-	}
-	if _, err := c.conn.Write(data); err != nil {
+	frame := make([]byte, 0, len(header)+len(data))
+	frame = append(frame, header...)
+	frame = append(frame, data...)
+
+	if _, err := c.conn.Write(frame); err != nil {
 		return err
 	}
 	return nil
@@ -295,4 +357,10 @@ func (c *Client) readFrame() (byte, []byte, error) {
 	return opcode, payload, nil
 }
 
-func (c *Client) IsClosed() bool { return c.closed }
+func (c *Client) IsClosed() bool {
+	return c.closed
+}
+
+func (c *Client) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
