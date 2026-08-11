@@ -12,6 +12,7 @@ import (
 	"tgws/internal/config"
 	"tgws/internal/crypto"
 	"tgws/internal/fake_tls"
+	"tgws/internal/stats"
 )
 
 type Handler struct {
@@ -34,11 +35,7 @@ func NewHandler(cfg *config.Config, secret []byte) *Handler {
 	return &Handler{cfg: cfg, secret: secret}
 }
 
-// ReadClientInit читает init packet от клиента
-// Поддерживает оба режима одновременно:
-// - Если пришёл TLS ClientHello -> Fake TLS режим (ee-secret)
-// - Иначе -> обычный dd-secret режим (независимо от masking)
-// - HTTP/HTTP2/TLS Alert -> masking
+// ReadClientInit читает init packet от клиента, обрабатывая Fake TLS если включен
 func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.ClientConn, error) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
@@ -50,7 +47,6 @@ func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.Cl
 	masking := h.cfg.FakeTLSDomain != ""
 
 	// === РЕЖИМ 1: Fake TLS (ee-secret) ===
-	// Первый байт 0x16 = TLS handshake record
 	if firstByte[0] == fake_tls.TLSRecordHandshake {
 		hdrRest := make([]byte, 4)
 		if _, err := io.ReadFull(conn, hdrRest); err != nil {
@@ -61,6 +57,7 @@ func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.Cl
 
 		if recLen < 1 || recLen > 65535 {
 			log.Printf("[%s] invalid TLS record length: %d -> masking", label, recLen)
+			stats.S.IncMasked()
 			go h.mask(conn, tlsHeader, label)
 			return nil, nil, fmt.Errorf("invalid TLS record length")
 		}
@@ -72,7 +69,6 @@ func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.Cl
 		clientHello := append(tlsHeader, recordBody...)
 
 		if !masking {
-			// Fake TLS выключен — отвечаем TLS Alert и закрываем
 			log.Printf("[%s] TLS ClientHello (Fake TLS disabled), rejecting", label)
 			h.HandleTLSMasking(conn, label)
 			return nil, nil, fmt.Errorf("TLS traffic without Fake TLS enabled")
@@ -80,13 +76,14 @@ func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.Cl
 
 		result, err := fake_tls.VerifyClientHello(clientHello, h.secret)
 		if err != nil {
-			// Невалидный ClientHello -> перенаправляем на реальный сайт (маскировка)
 			log.Printf("[%s] Fake TLS verify failed -> masking to %s: %v",
 				label, h.cfg.MaskDomain, err)
+			stats.S.IncMasked()
 			go fake_tls.ProxyToMaskingDomain(conn, clientHello, h.cfg.MaskDomain, label)
 			return nil, nil, fmt.Errorf("fake TLS verify failed: %w", err)
 		}
 
+		stats.S.IncFakeTLS()
 		log.Printf("[%s] ✓ Fake TLS handshake OK (ts=%d)", label, result.Timestamp)
 
 		serverHello := fake_tls.BuildServerHello(h.secret, result.ClientRandom, result.SessionID)
@@ -94,7 +91,6 @@ func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.Cl
 			return nil, nil, fmt.Errorf("write server hello: %w", err)
 		}
 
-		// Дальше весь трафик идёт внутри TLS records
 		stream := fake_tls.NewFakeTlsStream(conn)
 		handshake, err := stream.ReadExactly(crypto.HandshakeLen)
 		if err != nil {
@@ -106,39 +102,37 @@ func (h *Handler) ReadClientInit(conn net.Conn, label string) ([]byte, bridge.Cl
 	// === РЕЖИМ 2: HTTP/HTTP2/TLS Alert с masking -> redirect ===
 	if masking {
 		switch firstByte[0] {
-		case 'G', 'P', 'H', 'D', 'O': // GET, POST, HEAD, DELETE, OPTIONS
+		case 'G', 'P', 'H', 'D', 'O':
 			log.Printf("[%s] HTTP traffic '%c' -> redirect to %s", label, firstByte[0], h.cfg.MaskDomain)
+			stats.S.IncMasked()
 			redirect := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nLocation: https://%s/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", h.cfg.MaskDomain)
 			conn.Write([]byte(redirect))
 			return nil, nil, fmt.Errorf("HTTP traffic with masking")
 
 		case 0x15: // TLS Alert
 			log.Printf("[%s] TLS Alert -> masking", label)
+			stats.S.IncMasked()
 			go h.mask(conn, firstByte, label)
 			return nil, nil, fmt.Errorf("TLS alert")
 
-		case 0x14: // TLS Change Cipher Spec (не ClientHello)
+		case 0x14: // TLS Change Cipher Spec
 			log.Printf("[%s] TLS CCS -> masking", label)
+			stats.S.IncMasked()
 			go h.mask(conn, firstByte, label)
 			return nil, nil, fmt.Errorf("TLS CCS")
-		}
-		// Приоритет: HTTP/2 (PRI)
-		if firstByte[0] == 'P' {
-			// Уже обработано выше
 		}
 	}
 
 	// === РЕЖИМ 3: Обычный MTProto (dd-secret) ===
-	// Читаем оставшиеся 63 байта handshake
 	rest := make([]byte, crypto.HandshakeLen-1)
 	if _, err := io.ReadFull(conn, rest); err != nil {
 		return nil, nil, fmt.Errorf("read handshake: %w", err)
 	}
 	handshake := append(firstByte, rest...)
 
-	// Проверяем, не похож ли это на HTTP
 	if masking && isHTTPStart(handshake) {
 		log.Printf("[%s] HTTP-like handshake -> redirect", label)
+		stats.S.IncMasked()
 		redirect := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nLocation: https://%s/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", h.cfg.MaskDomain)
 		conn.Write([]byte(redirect))
 		return nil, nil, fmt.Errorf("HTTP-like traffic")
@@ -172,6 +166,7 @@ func isHTTPStart(data []byte) bool {
 func (h *Handler) HandleHandshake(handshake []byte, label string) (*HandshakeInfo, error) {
 	result, err := crypto.TryHandshake(handshake, h.secret)
 	if err != nil {
+		stats.S.IncBad()
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
 

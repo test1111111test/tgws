@@ -13,15 +13,18 @@ import (
 	"time"
 
 	"tgws/internal/bridge"
+	"tgws/internal/cfproxy"
 	"tgws/internal/config"
 	"tgws/internal/logger"
 	"tgws/internal/pool"
+	"tgws/internal/stats"
 	"tgws/internal/websocket"
 )
 
 type Server struct {
 	cfg    *config.Config
 	secret []byte
+	cf     *cfproxy.Manager
 
 	mu      sync.Mutex
 	running bool
@@ -45,6 +48,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	return &Server{
 		cfg:    cfg,
 		secret: secret,
+		cf:     cfproxy.New(cfg.CFDomainList(), cfg.CFUpdateURL, cfg.CFUpdateInterval),
 	}, nil
 }
 
@@ -105,6 +109,9 @@ func (s *Server) Start() error {
 		log.Printf("  Log file:      %s (max %dMB, keep %d files)",
 			s.cfg.LogFile, s.cfg.LogMaxSize, s.cfg.LogMaxFiles)
 	}
+	if total, black := s.cf.Count(); total > 0 {
+		log.Printf("  CF domains:    %d (blacklisted %d), cf_first=%v", total, black, s.cfg.CFFirst)
+	}
 	log.Println("  Target DC IPs:")
 	for dc, ip := range s.cfg.DCRedirects {
 		log.Printf("    DC%d: %s", dc, ip)
@@ -122,10 +129,30 @@ func (s *Server) Start() error {
 
 	s.wsPool.StartRotation(ctx)
 	go s.acceptLoop(ctx, l)
+	go s.statsLogger(ctx)
+
+	// Автообновление CF доменов
+	if s.cfg.CFAutoUpdate {
+		s.cf.StartAutoUpdate(ctx)
+	}
 
 	s.running = true
 	log.Println("Server started")
 	return nil
+}
+
+// statsLogger печатает сводку статистики раз в 60 секунд
+func (s *Server) statsLogger(ctx context.Context) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			log.Printf("STATS %s", stats.S.Summary())
+		}
+	}
 }
 
 // Stop останавливает сервер без завершения процесса
@@ -183,9 +210,42 @@ func (s *Server) acceptLoop(ctx context.Context, l net.Listener) {
 	}
 }
 
+// tryCF пробует до 3 CF-доменов, возвращает транспорт или nil
+func (s *Server) tryCF(clientCtx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
+	dcIdx := info.DCInt
+	if info.IsMedia {
+		dcIdx = -dcIdx
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		domain := s.cf.Next()
+		if domain == "" {
+			return nil, ""
+		}
+		path := cfproxy.CFPath(dcIdx)
+		log.Printf("[%s] DC%d -> trying CF fallback wss://%s%s", label, info.DC, domain, path)
+
+		ws, err := websocket.ConnectDomain(clientCtx, domain, path, 10*time.Second)
+		if err != nil {
+			log.Printf("[%s] ✗ CF fallback failed on %s: %v", label, domain, err)
+			s.cf.MarkBad(domain)
+			stats.S.IncCFErr()
+			continue
+		}
+
+		log.Printf("[%s] ✓ CF connected via %s", label, domain)
+		s.cf.MarkGood(domain)
+		return ws, "CF"
+	}
+	return nil, ""
+}
+
 func (s *Server) handleClient(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	label := conn.RemoteAddr().String()
+
+	stats.S.IncTotal()
+	stats.S.ActiveAdd(1)
+	defer stats.S.ActiveAdd(-1)
 
 	log.Printf("[%s] new connection", label)
 
@@ -230,18 +290,26 @@ func (s *Server) handleClient(ctx context.Context, conn net.Conn) {
 	var transport bridge.Transport
 	var transportType string
 
-	for _, domain := range info.WSDomains {
-		log.Printf("[%s] DC%d (test=%v) -> trying wss://%s%s (primary)",
-			label, info.DC, info.IsTestDC, domain, info.WSPath)
+	// Если включён cf_first — пробуем CF сразу (для заблокированных сетей)
+	if s.cfg.CFFirst {
+		transport, transportType = s.tryCF(clientCtx, info, label)
+	}
 
-		ws, err := websocket.ConnectDomainWithRedirect(clientCtx, domain, info.WSPath, 15*time.Second)
-		if err == nil {
-			log.Printf("[%s] ✓ WS connected via %s%s (primary)", label, domain, info.WSPath)
-			transport = ws
-			transportType = "WebSocket"
-			break
+	if transport == nil {
+		for _, domain := range info.WSDomains {
+			log.Printf("[%s] DC%d (test=%v) -> trying wss://%s%s (primary)",
+				label, info.DC, info.IsTestDC, domain, info.WSPath)
+
+			ws, err := websocket.ConnectDomainWithRedirect(clientCtx, domain, info.WSPath, 15*time.Second)
+			if err == nil {
+				log.Printf("[%s] ✓ WS connected via %s%s (primary)", label, domain, info.WSPath)
+				transport = ws
+				transportType = "WebSocket"
+				break
+			}
+			stats.S.IncWSErr()
+			log.Printf("[%s] ✗ primary path failed on %s: %v", label, domain, err)
 		}
-		log.Printf("[%s] ✗ primary path failed on %s: %v", label, domain, err)
 	}
 
 	if transport == nil {
@@ -258,6 +326,8 @@ func (s *Server) handleClient(ctx context.Context, conn net.Conn) {
 					transportType = "WebSocket"
 					break
 				}
+				stats.S.IncWSErr()
+				log.Printf("[%s] ✗ alt path %s failed on %s: %v", label, path, domain, err)
 			}
 			if transport != nil {
 				break
@@ -274,11 +344,18 @@ func (s *Server) handleClient(ctx context.Context, conn net.Conn) {
 				transportType = "WebSocket"
 				break
 			}
+			stats.S.IncWSErr()
+			log.Printf("[%s] ✗ WS via IP %s (%s) failed: %v", label, info.TargetIP, domain, err)
 		}
 	}
 
+	// CF fallback — если ещё не пробовали
+	if transport == nil && !s.cfg.CFFirst {
+		transport, transportType = s.tryCF(clientCtx, info, label)
+	}
+
 	if transport == nil {
-		log.Printf("[%s] All WS attempts failed, trying DIRECT TCP fallback to %s:443",
+		log.Printf("[%s] All WS/CF attempts failed, trying DIRECT TCP fallback to %s:443",
 			label, info.TargetIP)
 
 		tcpClient, err := bridge.ConnectDirect(clientCtx, info.TargetIP, 443, 15*time.Second)
@@ -292,10 +369,19 @@ func (s *Server) handleClient(ctx context.Context, conn net.Conn) {
 	}
 
 	if transport == nil {
-		log.Printf("[%s] ✗ ALL connection methods failed (WS + TCP)", label)
+		log.Printf("[%s] ✗ ALL connection methods failed (WS + CF + TCP)", label)
 		return
 	}
 	defer transport.Close()
+
+	switch transportType {
+	case "WebSocket":
+		stats.S.IncViaWS()
+	case "CF":
+		stats.S.IncViaCF()
+	default:
+		stats.S.IncViaTCP()
+	}
 
 	log.Printf("[%s] sending relay_init: %d bytes, head=%x (via %s)",
 		label, len(info.RelayInit), info.RelayInit[:16], transportType)

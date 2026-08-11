@@ -81,6 +81,10 @@ func ConnectDomain(ctx context.Context, domain, path string, timeout time.Durati
 		return nil, err
 	}
 
+	// ВАЖНО: снимаем дедлайны после хендшейка, иначе соединение
+	// умрёт ровно через timeout секунд
+	c.clearDeadlines()
+
 	return c, nil
 }
 
@@ -117,7 +121,16 @@ func Connect(ctx context.Context, host, domain, path string, timeout time.Durati
 		return nil, err
 	}
 
+	// ВАЖНО: снимаем дедлайны после хендшейка
+	c.clearDeadlines()
+
 	return c, nil
+}
+
+// clearDeadlines снимает все дедлайны — соединение живёт пока есть трафик
+func (c *Client) clearDeadlines() {
+	c.conn.SetReadDeadline(time.Time{})
+	c.conn.SetWriteDeadline(time.Time{})
 }
 
 func setTCPOptions(conn net.Conn) {
@@ -253,7 +266,6 @@ func (c *Client) Recv() ([]byte, error) {
 		case OpPing:
 			_ = c.sendFrame(OpPong, payload, true)
 		case OpPong:
-			log.Printf("[WS] received pong")
 			continue
 		case OpBinary:
 			return payload, nil

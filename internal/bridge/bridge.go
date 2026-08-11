@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"tgws/internal/crypto"
+	"tgws/internal/stats"
 )
 
 // ClientConn интерфейс для клиентского соединения
@@ -104,6 +105,7 @@ func (b *Bridge) tcpToWS(ctx context.Context) error {
 
 		b.upBytes += uint64(n)
 		b.upPackets++
+		stats.S.AddUp(int64(n))
 
 		if !b.firstUpLogged {
 			b.firstUpLogged = true
@@ -168,6 +170,7 @@ func (b *Bridge) wsToTCP(ctx context.Context) error {
 
 		b.downBytes += uint64(len(data))
 		b.downPackets++
+		stats.S.AddDown(int64(len(data)))
 
 		if !b.firstDownLogged {
 			b.firstDownLogged = true

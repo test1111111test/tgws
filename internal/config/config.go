@@ -23,10 +23,17 @@ type Config struct {
 	ForceTestDC   bool
 	MaskDomain    string
 	FakeTLSDomain string
-	LogFile       string // путь к файлу логов (пусто = только консоль)
-	LogMaxSize    int    // макс размер файла в MB
-	LogMaxFiles   int    // количество старых файлов
-	LogToConsole  bool   // выводить ли логи в консоль
+	LogFile       string
+	LogMaxSize    int
+	LogMaxFiles   int
+	LogToConsole  bool
+
+	// CloudFlare fallback
+	CFDomains        string // домены из конфига, через запятую
+	CFAutoUpdate     bool   // включать автообновление списка
+	CFUpdateURL      string // URL списка доменов
+	CFUpdateInterval int    // интервал обновления, сек
+	CFFirst          bool   // пробовать CF ПЕРВЫМ (для заблокированных сетей)
 }
 
 func DefaultConfig() *Config {
@@ -43,13 +50,18 @@ func DefaultConfig() *Config {
 			2: "149.154.167.51",
 			4: "149.154.167.91",
 		},
-		ForceTestDC:   false,
-		MaskDomain:    "www.google.com",
-		FakeTLSDomain: "",
-		LogFile:       "",   // по умолчанию только консоль
-		LogMaxSize:    10,   // 10 MB
-		LogMaxFiles:   5,    // хранить 5 файлов
-		LogToConsole:  true, // выводить в консоль
+		ForceTestDC:      false,
+		MaskDomain:       "www.google.com",
+		FakeTLSDomain:    "",
+		LogFile:          "",
+		LogMaxSize:       10,
+		LogMaxFiles:      5,
+		LogToConsole:     true,
+		CFDomains:        "",
+		CFAutoUpdate:     true,
+		CFUpdateURL:      "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
+		CFUpdateInterval: 3600,
+		CFFirst:          false,
 	}
 }
 
@@ -64,6 +76,18 @@ func (c *Config) EESecret() string {
 		return ""
 	}
 	return "ee" + c.Secret + hex.EncodeToString([]byte(c.FakeTLSDomain))
+}
+
+// CFDomainList возвращает список доменов из конфига
+func (c *Config) CFDomainList() []string {
+	var out []string
+	for _, d := range strings.Split(c.CFDomains, ",") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func (c *Config) LoadFromFile(filename string) error {
@@ -176,6 +200,20 @@ func (c *Config) setValue(key, value string) error {
 		c.LogMaxFiles = files
 	case "log_to_console":
 		c.LogToConsole = parseBool(value)
+	case "cf_domains":
+		c.CFDomains = value
+	case "cf_auto_update":
+		c.CFAutoUpdate = parseBool(value)
+	case "cf_update_url":
+		c.CFUpdateURL = value
+	case "cf_update_interval":
+		sec, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid cf_update_interval: %s", value)
+		}
+		c.CFUpdateInterval = sec
+	case "cf_first":
+		c.CFFirst = parseBool(value)
 	default:
 		return fmt.Errorf("unknown parameter: %s", key)
 	}
@@ -219,7 +257,6 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString("# ========================================\n\n")
 
 	sb.WriteString("# Путь к файлу логов (пусто = только консоль)\n")
-	sb.WriteString("# Пример: log_file = tgws.log\n")
 	sb.WriteString(fmt.Sprintf("log_file = %s\n\n", c.LogFile))
 
 	sb.WriteString("# Максимальный размер файла логов в мегабайтах\n")
@@ -230,6 +267,27 @@ func (c *Config) SaveToFile(filename string) error {
 
 	sb.WriteString("# Выводить ли логи в консоль\n")
 	sb.WriteString(fmt.Sprintf("log_to_console = %v\n\n", c.LogToConsole))
+
+	sb.WriteString("# ========================================\n")
+	sb.WriteString("# CloudFlare fallback\n")
+	sb.WriteString("# ========================================\n\n")
+
+	sb.WriteString("# Свои CF worker-домены, через запятую\n")
+	sb.WriteString("# Можно указывать с https:// и слэшами - приведётся к чистому домену\n")
+	sb.WriteString(fmt.Sprintf("cf_domains = %s\n\n", c.CFDomains))
+
+	sb.WriteString("# Автообновление списка CF доменов\n")
+	sb.WriteString(fmt.Sprintf("cf_auto_update = %v\n\n", c.CFAutoUpdate))
+
+	sb.WriteString("# URL списка доменов (текст, по домену в строке)\n")
+	sb.WriteString(fmt.Sprintf("cf_update_url = %s\n\n", c.CFUpdateURL))
+
+	sb.WriteString("# Интервал обновления, сек (мин 60)\n")
+	sb.WriteString(fmt.Sprintf("cf_update_interval = %d\n\n", c.CFUpdateInterval))
+
+	sb.WriteString("# Пробовать CF ПЕРВЫМ маршрутом (включи, если провайдер\n")
+	sb.WriteString("# блокирует прямые подключения к Telegram)\n")
+	sb.WriteString(fmt.Sprintf("cf_first = %v\n\n", c.CFFirst))
 
 	sb.WriteString("# Редиректы DC (формат: DC:IP,DC:IP)\n")
 	sb.WriteString(fmt.Sprintf("dc_ip = %s\n", formatDCIPs(c.DCRedirects)))
