@@ -44,6 +44,22 @@ func (s *Stats) IncPoolMiss()      { s.poolMis.Add(1) }
 func (s *Stats) AddUp(n int64)     { s.up.Add(n) }
 func (s *Stats) AddDown(n int64)   { s.down.Add(n) }
 
+// === Геттеры для GUI ===
+func (s *Stats) Total() int64     { return s.total.Load() }
+func (s *Stats) Active() int64    { return s.active.Load() }
+func (s *Stats) Bad() int64       { return s.bad.Load() }
+func (s *Stats) ViaWS() int64     { return s.viaWS.Load() }
+func (s *Stats) ViaTCP() int64    { return s.viaTCP.Load() }
+func (s *Stats) ViaCF() int64     { return s.viaCF.Load() }
+func (s *Stats) Masked() int64    { return s.masked.Load() }
+func (s *Stats) FakeTLS() int64   { return s.fakeTLS.Load() }
+func (s *Stats) WSErr() int64     { return s.wsErr.Load() }
+func (s *Stats) CFErr() int64     { return s.cfErr.Load() }
+func (s *Stats) PoolHit() int64   { return s.poolHit.Load() }
+func (s *Stats) PoolMiss() int64  { return s.poolMis.Load() }
+func (s *Stats) UpBytes() int64   { return s.up.Load() }
+func (s *Stats) DownBytes() int64 { return s.down.Load() }
+
 // Uptime возвращает время работы.
 func (s *Stats) Uptime() time.Duration { return time.Since(s.start) }
 

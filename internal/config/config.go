@@ -27,13 +27,14 @@ type Config struct {
 	LogMaxSize    int
 	LogMaxFiles   int
 	LogToConsole  bool
+	Verbose       bool
 
 	// CloudFlare fallback
-	CFDomains        string // домены из конфига, через запятую
-	CFAutoUpdate     bool   // включать автообновление списка
-	CFUpdateURL      string // URL списка доменов
-	CFUpdateInterval int    // интервал обновления, сек
-	CFFirst          bool   // пробовать CF ПЕРВЫМ (для заблокированных сетей)
+	CFDomains        string
+	CFAutoUpdate     bool
+	CFUpdateURL      string
+	CFUpdateInterval int
+	CFFirst          bool
 }
 
 func DefaultConfig() *Config {
@@ -57,6 +58,7 @@ func DefaultConfig() *Config {
 		LogMaxSize:       10,
 		LogMaxFiles:      5,
 		LogToConsole:     true,
+		Verbose:          true,
 		CFDomains:        "",
 		CFAutoUpdate:     true,
 		CFUpdateURL:      "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
@@ -97,7 +99,6 @@ func (c *Config) LoadFromFile(filename string) error {
 	}
 	defer file.Close()
 
-	// Пропускаем UTF-8 BOM если есть
 	bom := make([]byte, 3)
 	n, err := file.Read(bom)
 	if err != nil && err != io.EOF {
@@ -200,6 +201,8 @@ func (c *Config) setValue(key, value string) error {
 		c.LogMaxFiles = files
 	case "log_to_console":
 		c.LogToConsole = parseBool(value)
+	case "verbose":
+		c.Verbose = parseBool(value)
 	case "cf_domains":
 		c.CFDomains = value
 	case "cf_auto_update":
@@ -234,7 +237,6 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString(fmt.Sprintf("port = %d\n\n", c.Port))
 
 	sb.WriteString("# MTProto secret (32 hex символа)\n")
-	sb.WriteString("# Если пусто - будет сгенерирован автоматически\n")
 	sb.WriteString(fmt.Sprintf("secret = %s\n\n", c.Secret))
 
 	sb.WriteString("# Размер буфера сокета в байтах\n")
@@ -268,12 +270,15 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString("# Выводить ли логи в консоль\n")
 	sb.WriteString(fmt.Sprintf("log_to_console = %v\n\n", c.LogToConsole))
 
+	sb.WriteString("# Подробные пакетные логи (Splitter, дампы шифров)\n")
+	sb.WriteString("# Для продакшена ставь false — логи станут тихими\n")
+	sb.WriteString(fmt.Sprintf("verbose = %v\n\n", c.Verbose))
+
 	sb.WriteString("# ========================================\n")
 	sb.WriteString("# CloudFlare fallback\n")
 	sb.WriteString("# ========================================\n\n")
 
 	sb.WriteString("# Свои CF worker-домены, через запятую\n")
-	sb.WriteString("# Можно указывать с https:// и слэшами - приведётся к чистому домену\n")
 	sb.WriteString(fmt.Sprintf("cf_domains = %s\n\n", c.CFDomains))
 
 	sb.WriteString("# Автообновление списка CF доменов\n")
@@ -285,8 +290,7 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString("# Интервал обновления, сек (мин 60)\n")
 	sb.WriteString(fmt.Sprintf("cf_update_interval = %d\n\n", c.CFUpdateInterval))
 
-	sb.WriteString("# Пробовать CF ПЕРВЫМ маршрутом (включи, если провайдер\n")
-	sb.WriteString("# блокирует прямые подключения к Telegram)\n")
+	sb.WriteString("# Пробовать CF ПЕРВЫМ маршрутом (для заблокированных сетей)\n")
 	sb.WriteString(fmt.Sprintf("cf_first = %v\n\n", c.CFFirst))
 
 	sb.WriteString("# Редиректы DC (формат: DC:IP,DC:IP)\n")

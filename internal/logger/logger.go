@@ -6,22 +6,20 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
 // RotatingFileWriter пишет логи в файл с автоматической ротацией по размеру
 type RotatingFileWriter struct {
 	path     string
-	maxSize  int64 // в байтах
+	maxSize  int64
 	maxFiles int
 	file     *os.File
 	size     int64
 	mu       sync.Mutex
 }
 
-// NewRotatingFileWriter создаёт writer с ротацией
-// maxSizeMB - максимальный размер файла в мегабайтах
-// maxFiles - количество старых файлов для хранения
 func NewRotatingFileWriter(path string, maxSizeMB int, maxFiles int) (*RotatingFileWriter, error) {
 	if maxSizeMB < 1 {
 		maxSizeMB = 10
@@ -65,15 +63,12 @@ func (w *RotatingFileWriter) open() error {
 	return nil
 }
 
-// Write реализует io.Writer
 func (w *RotatingFileWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Проверяем нужна ли ротация
 	if w.size+int64(len(p)) > w.maxSize {
 		if err := w.rotate(); err != nil {
-			// Логируем в stderr, чтобы не терять данные
 			fmt.Fprintf(os.Stderr, "WARNING: log rotation failed: %v\n", err)
 		}
 	}
@@ -83,31 +78,25 @@ func (w *RotatingFileWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// rotate переименовывает текущий файл и создаёт новый
 func (w *RotatingFileWriter) rotate() error {
 	w.file.Close()
 
-	// Сдвигаем существующие файлы: .3 -> .4, .2 -> .3, .1 -> .2
 	for i := w.maxFiles - 1; i >= 1; i-- {
 		src := fmt.Sprintf("%s.%d", w.path, i)
 		dst := fmt.Sprintf("%s.%d", w.path, i+1)
-		os.Rename(src, dst) // игнорируем ошибки (файл может не существовать)
+		os.Rename(src, dst)
 	}
 
-	// Переименовываем текущий в .1
 	if err := os.Rename(w.path, w.path+".1"); err != nil {
-		// Если переименование не удалось, пробуем открыть новый файл
 		return w.open()
 	}
 
-	// Удаляем самый старый файл если превысили лимит
 	oldest := fmt.Sprintf("%s.%d", w.path, w.maxFiles+1)
 	os.Remove(oldest)
 
 	return w.open()
 }
 
-// Close закрывает файл
 func (w *RotatingFileWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -117,30 +106,72 @@ func (w *RotatingFileWriter) Close() error {
 	return nil
 }
 
-// Setup настраивает логирование в файл и/или консоль
-// Возвращает Closer который нужно закрыть при завершении программы
-// Если logFile пустой - только консольный вывод
-func Setup(logFile string, maxSizeMB int, maxFiles int, toConsole bool) (io.Closer, error) {
-	if logFile == "" {
-		// Только консоль
-		if !toConsole {
-			log.SetOutput(io.Discard)
+// swallowWriter игнорирует ошибки записи (для stdout в GUI-сборке без консоли)
+type swallowWriter struct {
+	w io.Writer
+}
+
+func (s swallowWriter) Write(p []byte) (int, error) {
+	_, _ = s.w.Write(p)
+	return len(p), nil
+}
+
+// quietSubstr — строки, скрываемые при verbose=false (пакетный шум)
+var quietSubstr = []string{
+	"Splitter:",
+	"↑ PLAINTEXT",
+	"↑ TG_CIPHER",
+	"↑ SPLITTER",
+	"↑ FIRST from client",
+	"↓ PLAINTEXT",
+	"↓ CLIENT_CIPHER",
+	"↓ FIRST from DC",
+	"sending relay_init",
+}
+
+// filterWriter отбрасывает шумные отладочные строки, когда verbose выключен
+type filterWriter struct {
+	inner   io.Writer
+	verbose bool
+}
+
+func (f *filterWriter) Write(p []byte) (int, error) {
+	if !f.verbose {
+		s := string(p)
+		for _, sub := range quietSubstr {
+			if strings.Contains(s, sub) {
+				return len(p), nil
+			}
 		}
-		return nil, nil
 	}
+	return f.inner.Write(p)
+}
 
-	writer, err := NewRotatingFileWriter(logFile, maxSizeMB, maxFiles)
-	if err != nil {
-		return nil, err
-	}
+// Setup настраивает логирование в файл и/или консоль с учётом verbose.
+// Файл пишется ПЕРВЫМ, ошибки stdout игнорируются — поэтому логи работают
+// и в GUI-сборке без консоли (windowsgui), и в обычной консольной.
+func Setup(logFile string, maxSizeMB int, maxFiles int, toConsole bool, verbose bool) (io.Closer, error) {
+	console := swallowWriter{os.Stdout}
 
-	var output io.Writer
-	if toConsole {
-		output = io.MultiWriter(os.Stdout, writer)
+	var base io.Writer
+	var closer io.Closer
+
+	if logFile == "" {
+		base = console
 	} else {
-		output = writer
+		writer, err := NewRotatingFileWriter(logFile, maxSizeMB, maxFiles)
+		if err != nil {
+			return nil, err
+		}
+		closer = writer
+		if toConsole {
+			// файл первым: даже если stdout мёртвый (GUI-сборка), файл получит данные
+			base = io.MultiWriter(writer, console)
+		} else {
+			base = writer
+		}
 	}
 
-	log.SetOutput(output)
-	return writer, nil
+	log.SetOutput(&filterWriter{inner: base, verbose: verbose})
+	return closer, nil
 }

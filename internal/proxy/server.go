@@ -10,11 +10,14 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"tgws/internal/balancer"
 	"tgws/internal/bridge"
 	"tgws/internal/cfproxy"
 	"tgws/internal/config"
+	"tgws/internal/crypto"
 	"tgws/internal/logger"
 	"tgws/internal/pool"
 	"tgws/internal/stats"
@@ -25,6 +28,11 @@ type Server struct {
 	cfg    *config.Config
 	secret []byte
 	cf     *cfproxy.Manager
+	bal    *balancer.Balancer
+
+	// здоровье WS-маршрутов: после серии падений идём сразу в CF
+	wsFailStreak atomic.Int64
+	wsLastOK     atomic.Int64
 
 	mu      sync.Mutex
 	running bool
@@ -49,6 +57,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		cfg:    cfg,
 		secret: secret,
 		cf:     cfproxy.New(cfg.CFDomainList(), cfg.CFUpdateURL, cfg.CFUpdateInterval),
+		bal:    balancer.New(),
 	}, nil
 }
 
@@ -57,6 +66,25 @@ func (s *Server) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
+}
+
+// === здоровье WS ===
+
+func (s *Server) wsOK() {
+	s.wsFailStreak.Store(0)
+	s.wsLastOK.Store(time.Now().Unix())
+}
+
+func (s *Server) wsFail() {
+	s.wsFailStreak.Add(1)
+}
+
+// wsDead: 4+ падений подряд и последнего успеха не было >2 минут
+func (s *Server) wsDead() bool {
+	if s.wsFailStreak.Load() < 4 {
+		return false
+	}
+	return time.Now().Unix()-s.wsLastOK.Load() > 120
 }
 
 // Start запускает сервер. Может вызываться повторно после Stop.
@@ -70,7 +98,7 @@ func (s *Server) Start() error {
 
 	// Логгер настраиваем только один раз
 	if !s.logStarted {
-		closer, err := logger.Setup(s.cfg.LogFile, s.cfg.LogMaxSize, s.cfg.LogMaxFiles, s.cfg.LogToConsole)
+		closer, err := logger.Setup(s.cfg.LogFile, s.cfg.LogMaxSize, s.cfg.LogMaxFiles, s.cfg.LogToConsole, s.cfg.Verbose)
 		if err != nil {
 			return fmt.Errorf("setup logger: %w", err)
 		}
@@ -105,6 +133,7 @@ func (s *Server) Start() error {
 	}
 	log.Printf("  Pool size:     %d", s.cfg.PoolSize)
 	log.Printf("  Mask domain:   %s", s.cfg.MaskDomain)
+	log.Printf("  Verbose:       %v", s.cfg.Verbose)
 	if s.cfg.LogFile != "" {
 		log.Printf("  Log file:      %s (max %dMB, keep %d files)",
 			s.cfg.LogFile, s.cfg.LogMaxSize, s.cfg.LogMaxFiles)
@@ -136,9 +165,32 @@ func (s *Server) Start() error {
 		s.cf.StartAutoUpdate(ctx)
 	}
 
+	// Warmup пула (заодно работает как пробник здоровья WS)
+	if !s.cfg.CFFirst {
+		s.warmupPool(ctx)
+	}
+
 	s.running = true
 	log.Println("Server started")
 	return nil
+}
+
+// warmupPool заранее устанавливает WS-соединения к настроенным DC
+func (s *Server) warmupPool(ctx context.Context) {
+	for dc, ip := range s.cfg.DCRedirects {
+		go func(dc int, ip string) {
+			domains := crypto.WSDomains(dc, false)
+			ws, err := s.connectWS(ctx, ip, domains)
+			if err != nil {
+				s.wsFail()
+				log.Printf("Pool warmup DC%d failed: %v", dc, err)
+				return
+			}
+			s.wsOK()
+			s.wsPool.Put(dc, false, ws)
+			log.Printf("Pool warmup DC%d: connection ready", dc)
+		}(dc, ip)
+	}
 }
 
 // statsLogger печатает сводку статистики раз в 60 секунд
@@ -210,8 +262,122 @@ func (s *Server) acceptLoop(ctx context.Context, l net.Listener) {
 	}
 }
 
+// tryWSChain — последовательная WS-цепочка (primary → alt → via IP)
+func (s *Server) tryWSChain(ctx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
+	for _, domain := range s.bal.Order(info.WSDomains) {
+		log.Printf("[%s] DC%d (test=%v) -> trying wss://%s%s (primary)",
+			label, info.DC, info.IsTestDC, domain, info.WSPath)
+
+		ws, err := websocket.ConnectDomainWithRedirect(ctx, domain, info.WSPath, 15*time.Second)
+		if err == nil {
+			log.Printf("[%s] ✓ WS connected via %s%s (primary)", label, domain, info.WSPath)
+			s.bal.MarkOK(domain)
+			s.wsOK()
+			return ws, "WebSocket"
+		}
+		stats.S.IncWSErr()
+		s.bal.MarkFail(domain)
+		s.wsFail()
+		log.Printf("[%s] ✗ primary path failed on %s: %v", label, domain, err)
+	}
+
+	log.Printf("[%s] Primary path failed, trying alternatives...", label)
+	for _, path := range websocket.AllPaths {
+		if path == info.WSPath {
+			continue
+		}
+		for _, domain := range s.bal.Order(info.WSDomains) {
+			ws, err := websocket.ConnectDomainWithRedirect(ctx, domain, path, 10*time.Second)
+			if err == nil {
+				log.Printf("[%s] ✓ WS connected via %s%s (fallback)", label, domain, path)
+				s.bal.MarkOK(domain)
+				s.wsOK()
+				return ws, "WebSocket"
+			}
+			stats.S.IncWSErr()
+			s.bal.MarkFail(domain)
+			s.wsFail()
+			log.Printf("[%s] ✗ alt path %s failed on %s: %v", label, path, domain, err)
+		}
+	}
+
+	for _, domain := range info.WSDomains {
+		ws, err := websocket.Connect(ctx, info.TargetIP, domain, info.WSPath, 10*time.Second)
+		if err == nil {
+			log.Printf("[%s] ✓ WS connected via IP %s", label, info.TargetIP)
+			s.wsOK()
+			return ws, "WebSocket"
+		}
+		stats.S.IncWSErr()
+		s.wsFail()
+		log.Printf("[%s] ✗ WS via IP %s (%s) failed: %v", label, info.TargetIP, domain, err)
+	}
+
+	return nil, ""
+}
+
+// raceWSvsCF — WS-цепочка и CF параллельно, берём первый успешный транспорт
+func (s *Server) raceWSvsCF(ctx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
+	total, _ := s.cf.Count()
+	if total == 0 {
+		return s.tryWSChain(ctx, info, label)
+	}
+
+	type res struct {
+		t   bridge.Transport
+		typ string
+	}
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	wsCh := make(chan res, 1)
+	cfCh := make(chan res, 1)
+
+	go func() {
+		t, typ := s.tryWSChain(raceCtx, info, label)
+		wsCh <- res{t, typ}
+	}()
+	go func() {
+		t, typ := s.tryCF(raceCtx, info, label)
+		cfCh <- res{t, typ}
+	}()
+
+	var transport bridge.Transport
+	var transportType string
+
+	for i := 0; i < 2; i++ {
+		var r res
+		select {
+		case r = <-wsCh:
+		case r = <-cfCh:
+		}
+		if r.t != nil {
+			transport = r.t
+			transportType = r.typ
+			break
+		}
+	}
+	cancel() // отменяем гонку проигравшего
+
+	// дозакрываем транспорт проигравшего, если он доехал позже
+	go func() {
+		select {
+		case r := <-wsCh:
+			if r.t != nil {
+				r.t.Close()
+			}
+		case r := <-cfCh:
+			if r.t != nil {
+				r.t.Close()
+			}
+		case <-time.After(90 * time.Second):
+		}
+	}()
+
+	return transport, transportType
+}
+
 // tryCF пробует до 3 CF-доменов, возвращает транспорт или nil
-func (s *Server) tryCF(clientCtx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
+func (s *Server) tryCF(ctx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
 	dcIdx := info.DCInt
 	if info.IsMedia {
 		dcIdx = -dcIdx
@@ -224,7 +390,7 @@ func (s *Server) tryCF(clientCtx context.Context, info *HandshakeInfo, label str
 		path := cfproxy.CFPath(dcIdx)
 		log.Printf("[%s] DC%d -> trying CF fallback wss://%s%s", label, info.DC, domain, path)
 
-		ws, err := websocket.ConnectDomain(clientCtx, domain, path, 10*time.Second)
+		ws, err := websocket.ConnectDomain(ctx, domain, path, 10*time.Second)
 		if err != nil {
 			log.Printf("[%s] ✗ CF fallback failed on %s: %v", label, domain, err)
 			s.cf.MarkBad(domain)
@@ -287,71 +453,32 @@ func (s *Server) handleClient(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Готовое соединение из пула (результат warmup/refill)
 	var transport bridge.Transport
 	var transportType string
-
-	// Если включён cf_first — пробуем CF сразу (для заблокированных сетей)
-	if s.cfg.CFFirst {
-		transport, transportType = s.tryCF(clientCtx, info, label)
-	}
-
-	if transport == nil {
-		for _, domain := range info.WSDomains {
-			log.Printf("[%s] DC%d (test=%v) -> trying wss://%s%s (primary)",
-				label, info.DC, info.IsTestDC, domain, info.WSPath)
-
-			ws, err := websocket.ConnectDomainWithRedirect(clientCtx, domain, info.WSPath, 15*time.Second)
-			if err == nil {
-				log.Printf("[%s] ✓ WS connected via %s%s (primary)", label, domain, info.WSPath)
-				transport = ws
-				transportType = "WebSocket"
-				break
-			}
-			stats.S.IncWSErr()
-			log.Printf("[%s] ✗ primary path failed on %s: %v", label, domain, err)
+	if !info.IsTestDC {
+		if ws, _ := s.wsPool.Get(clientCtx, info.DCInt, info.IsMedia, info.TargetIP, info.WSDomains); ws != nil {
+			log.Printf("[%s] ✓ WS taken from pool (DC%d)", label, info.DC)
+			transport = ws
+			transportType = "WebSocket"
+			s.wsOK()
 		}
 	}
 
 	if transport == nil {
-		log.Printf("[%s] Primary path failed, trying alternatives...", label)
-		for _, path := range websocket.AllPaths {
-			if path == info.WSPath {
-				continue
+		if s.cfg.CFFirst || s.wsDead() {
+			// WS принудительно первым или признан мёртвым — CF сразу
+			if s.wsDead() && !s.cfg.CFFirst {
+				log.Printf("[%s] WS routes look dead — using CF first", label)
 			}
-			for _, domain := range info.WSDomains {
-				ws, err := websocket.ConnectDomainWithRedirect(clientCtx, domain, path, 10*time.Second)
-				if err == nil {
-					log.Printf("[%s] ✓ WS connected via %s%s (fallback)", label, domain, path)
-					transport = ws
-					transportType = "WebSocket"
-					break
-				}
-				stats.S.IncWSErr()
-				log.Printf("[%s] ✗ alt path %s failed on %s: %v", label, path, domain, err)
+			transport, transportType = s.tryCF(clientCtx, info, label)
+			if transport == nil {
+				transport, transportType = s.tryWSChain(clientCtx, info, label)
 			}
-			if transport != nil {
-				break
-			}
+		} else {
+			// здоровье WS неизвестно/хорошее — гонка WS и CF
+			transport, transportType = s.raceWSvsCF(clientCtx, info, label)
 		}
-	}
-
-	if transport == nil {
-		for _, domain := range info.WSDomains {
-			ws, err := websocket.Connect(clientCtx, info.TargetIP, domain, info.WSPath, 10*time.Second)
-			if err == nil {
-				log.Printf("[%s] ✓ WS connected via IP %s", label, info.TargetIP)
-				transport = ws
-				transportType = "WebSocket"
-				break
-			}
-			stats.S.IncWSErr()
-			log.Printf("[%s] ✗ WS via IP %s (%s) failed: %v", label, info.TargetIP, domain, err)
-		}
-	}
-
-	// CF fallback — если ещё не пробовали
-	if transport == nil && !s.cfg.CFFirst {
-		transport, transportType = s.tryCF(clientCtx, info, label)
 	}
 
 	if transport == nil {

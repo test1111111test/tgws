@@ -19,7 +19,14 @@ const configFileName = "config.ini"
 func main() {
 	noGUI := flag.Bool("no-gui", false, "Запуск без системного трея (фоновый режим)")
 	dumpIcon := flag.Bool("dump-icon", false, "Записать icon.ico рядом с exe и выйти")
+	withConsole := flag.Bool("console", false, "Показать консоль с логами (для отладки)")
 	flag.Parse()
+
+	// Если нужна консоль (в GUI-сборке по умолчанию её нет)
+	if *withConsole {
+		gui.AllocConsole()
+		log.Println("Console attached")
+	}
 
 	// Определяем путь к папке с exe
 	exePath, err := os.Executable()
@@ -71,7 +78,7 @@ func main() {
 	if useGUI {
 		log.Println("Starting with system tray...")
 
-		// Обработчик сигналов в фоне (Ctrl+C завершает процесс)
+		// Обработчик сигналов в фоне (Ctrl+C в консоль-режиме)
 		go func() {
 			sig := <-sigChan
 			log.Printf("Received signal %v, shutting down...", sig)
@@ -83,7 +90,7 @@ func main() {
 		tray := gui.NewTrayManager(cfg, server)
 		tray.Run()
 
-		// Сюда попадаем после "Выход" из трея — процесс завершится (exe выгрузится)
+		// Сюда попадаем после "Выход" из трея — процесс завершится
 		server.Stop()
 	} else {
 		// Фоновый режим — ждём сигнала

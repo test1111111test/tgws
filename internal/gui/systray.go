@@ -23,6 +23,12 @@ type TrayManager struct {
 
 	status *systray.MenuItem
 	toggle *systray.MenuItem
+
+	// Инфо-пункты с живыми метриками
+	mConn    *systray.MenuItem
+	mTraffic *systray.MenuItem
+	mRoutes  *systray.MenuItem
+	mErr     *systray.MenuItem
 }
 
 // NewTrayManager создаёт менеджер трея
@@ -45,7 +51,6 @@ func (m *TrayManager) onReady() {
 	systray.SetTitle("TGWS Proxy")
 	systray.SetTooltip(m.tooltip())
 
-	// Статус (неактивный пункт)
 	if m.server.IsRunning() {
 		m.status = systray.AddMenuItem("● Работает", "Состояние прокси")
 	} else {
@@ -54,7 +59,6 @@ func (m *TrayManager) onReady() {
 	m.status.Disable()
 	systray.AddSeparator()
 
-	// СТАРТ / СТОП без выгрузки exe
 	if m.server.IsRunning() {
 		m.toggle = systray.AddMenuItem("■ Остановить", "Остановить прокси (программа остаётся в трее)")
 	} else {
@@ -63,13 +67,25 @@ func (m *TrayManager) onReady() {
 
 	mShowLinks := systray.AddMenuItem("Скопировать ссылку подключения", "Скопировать ссылку Telegram в буфер обмена")
 	mStats := systray.AddMenuItem("Статистика", "Показать статистику")
+	systray.AddSeparator()
+
+	m.mConn = systray.AddMenuItem("Подключений: 0 (активно 0)", "Счётчик подключений")
+	m.mTraffic = systray.AddMenuItem("Трафик: ↑0B ↓0B", "Трафик и скорость")
+	m.mRoutes = systray.AddMenuItem("Маршруты: WS 0 | CF 0 | TCP 0", "Какой маршрут используется")
+	m.mErr = systray.AddMenuItem("Ошибки: WS 0 | CF 0 | bad 0", "Счётчик ошибок")
+	for _, mi := range []*systray.MenuItem{m.mConn, m.mTraffic, m.mRoutes, m.mErr} {
+		mi.Disable()
+	}
+	systray.AddSeparator()
+
 	mOpenConfig := systray.AddMenuItem("Открыть config.ini", "Открыть конфигурацию в Блокноте")
 	mOpenLogs := systray.AddMenuItem("Открыть папку с логами", "Открыть папку с файлами логов")
 	mDumpIcon := systray.AddMenuItem("Сохранить icon.ico", "Записать icon.ico рядом с exe")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Выход", "Остановить прокси и закрыть программу")
 
-	// Цикл обработки событий
+	m.startMetricsUpdater()
+
 	go func() {
 		for {
 			select {
@@ -99,7 +115,42 @@ func (m *TrayManager) onExit() {
 	log.Println("System tray exited")
 }
 
-// onToggle переключает СТАРТ/СТОП сервера без выгрузки exe
+// startMetricsUpdater раз в 5 секунд обновляет метрики в меню и тултипе
+func (m *TrayManager) startMetricsUpdater() {
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+
+		prevUp, prevDown := stats.S.UpBytes(), stats.S.DownBytes()
+		prevT := time.Now()
+
+		for range t.C {
+			up, down := stats.S.UpBytes(), stats.S.DownBytes()
+			now := time.Now()
+			dt := now.Sub(prevT).Seconds()
+
+			var upRate, downRate float64
+			if dt > 0 {
+				upRate = float64(up-prevUp) / dt
+				downRate = float64(down-prevDown) / dt
+			}
+			prevUp, prevDown, prevT = up, down, now
+
+			m.mConn.SetTitle(fmt.Sprintf("Подключений: %d (активно %d)",
+				stats.S.Total(), stats.S.Active()))
+			m.mTraffic.SetTitle(fmt.Sprintf("Трафик: ↑%s ↓%s | %s / %s",
+				humanB(up), humanB(down), rateStr(upRate), rateStr(downRate)))
+			m.mRoutes.SetTitle(fmt.Sprintf("Маршруты: WS %d | CF %d | TCP %d",
+				stats.S.ViaWS(), stats.S.ViaCF(), stats.S.ViaTCP()))
+			m.mErr.SetTitle(fmt.Sprintf("Ошибки: WS %d | CF %d | bad %d",
+				stats.S.WSErr(), stats.S.CFErr(), stats.S.Bad()))
+
+			systray.SetTooltip(fmt.Sprintf("TGWS | %s | act=%d | ↑%s ↓%s",
+				durStr(stats.S.Uptime()), stats.S.Active(), humanB(up), humanB(down)))
+		}
+	}()
+}
+
 func (m *TrayManager) onToggle() {
 	if m.server.IsRunning() {
 		m.server.Stop()
@@ -120,7 +171,6 @@ func (m *TrayManager) onToggle() {
 	}
 }
 
-// showStats выводит статистику: в лог, в тултип и во всплывающее окно
 func (m *TrayManager) showStats() {
 	log.Println("Stats requested from tray")
 	report := stats.S.Report()
@@ -128,7 +178,6 @@ func (m *TrayManager) showStats() {
 
 	systray.SetTooltip(stats.S.Short())
 
-	// Видимое всплывающее окно — чтобы результат был заметен сразу
 	go showMessageBox(report, "TGWS Proxy - статистика")
 
 	go func() {
@@ -137,7 +186,6 @@ func (m *TrayManager) showStats() {
 	}()
 }
 
-// showMessageBox показывает Windows MessageBox через PowerShell
 func showMessageBox(text, title string) {
 	if runtime.GOOS != "windows" {
 		return
@@ -155,7 +203,6 @@ func (m *TrayManager) tooltip() string {
 	return "TGWS Proxy | остановлен"
 }
 
-// copyLinks копирует ссылки подключения в буфер обмена
 func (m *TrayManager) copyLinks() {
 	link := fmt.Sprintf("tg://proxy?server=%s&port=%d&secret=dd%s",
 		m.cfg.Host, m.cfg.Port, m.cfg.Secret)
@@ -180,7 +227,6 @@ func (m *TrayManager) copyLinks() {
 	}()
 }
 
-// openConfig открывает config.ini в Блокноте
 func (m *TrayManager) openConfig() {
 	configPath := filepath.Join(exeDir(), "config.ini")
 	if err := openInEditor(configPath); err != nil {
@@ -188,14 +234,12 @@ func (m *TrayManager) openConfig() {
 	}
 }
 
-// openLogs открывает папку с логами в проводнике
 func (m *TrayManager) openLogs() {
 	if err := openInExplorer(exeDir()); err != nil {
 		log.Printf("Не удалось открыть папку с логами: %v", err)
 	}
 }
 
-// dumpIcon выписывает icon.ico рядом с exe
 func (m *TrayManager) dumpIcon() {
 	out := filepath.Join(exeDir(), "icon.ico")
 	if err := os.WriteFile(out, GenerateIcon(), 0644); err != nil {
@@ -210,7 +254,33 @@ func (m *TrayManager) dumpIcon() {
 	}()
 }
 
-// copyToClipboard копирует текст в буфер обмена (Windows)
+func humanB(n int64) string {
+	v := float64(n)
+	for _, u := range []string{"B", "KB", "MB", "GB"} {
+		if v < 1024 {
+			return fmt.Sprintf("%.1f%s", v, u)
+		}
+		v /= 1024
+	}
+	return fmt.Sprintf("%.1fTB", v)
+}
+
+func rateStr(bps float64) string {
+	if bps < 0 {
+		bps = 0
+	}
+	v := bps
+	for _, u := range []string{"B/s", "KB/s", "MB/s"} {
+		if v < 1024 {
+			return fmt.Sprintf("%.1f%s", v, u)
+		}
+		v /= 1024
+	}
+	return fmt.Sprintf("%.1fGB/s", v)
+}
+
+func durStr(d time.Duration) string { return d.Round(time.Second).String() }
+
 func copyToClipboard(text string) error {
 	if runtime.GOOS != "windows" {
 		return fmt.Errorf("clipboard supported only on Windows")
@@ -220,7 +290,6 @@ func copyToClipboard(text string) error {
 	return cmd.Run()
 }
 
-// openInEditor открывает файл в Блокноте
 func openInEditor(path string) error {
 	if runtime.GOOS == "windows" {
 		return exec.Command("notepad.exe", path).Start()
@@ -228,7 +297,6 @@ func openInEditor(path string) error {
 	return fmt.Errorf("open editor not supported on %s", runtime.GOOS)
 }
 
-// openInExplorer открывает папку в проводнике
 func openInExplorer(path string) error {
 	if runtime.GOOS == "windows" {
 		return exec.Command("explorer.exe", path).Start()
@@ -236,7 +304,6 @@ func openInExplorer(path string) error {
 	return fmt.Errorf("open explorer not supported on %s", runtime.GOOS)
 }
 
-// exeDir возвращает путь к папке с exe
 func exeDir() string {
 	p, err := os.Executable()
 	if err != nil {
@@ -245,7 +312,6 @@ func exeDir() string {
 	return filepath.Dir(p)
 }
 
-// escapePS экранирует одинарные кавычки для PowerShell
 func escapePS(s string) string {
 	result := ""
 	for _, c := range s {

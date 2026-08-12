@@ -48,6 +48,13 @@ func (e *HandshakeError) IsRedirect() bool {
 
 var AllPaths = []string{"/apiws", "/apiws_test"}
 
+// dialTLS — TLS-подключение, уважающее context: cancel() мгновенно обрывает dial
+func dialTLS(ctx context.Context, addr string, cfg *tls.Config, timeout time.Duration) (net.Conn, error) {
+	nd := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	d := &tls.Dialer{NetDialer: nd, Config: cfg}
+	return d.DialContext(ctx, "tcp", addr)
+}
+
 func ConnectDomain(ctx context.Context, domain, path string, timeout time.Duration) (*Client, error) {
 	if path == "" {
 		path = "/apiws"
@@ -60,9 +67,8 @@ func ConnectDomain(ctx context.Context, domain, path string, timeout time.Durati
 		ServerName:         domain,
 		InsecureSkipVerify: true,
 	}
-	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 
-	conn, err := tls.DialWithDialer(dialer, "tcp", domain+":443", tlsConfig)
+	conn, err := dialTLS(ctx, domain+":443", tlsConfig, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial to %s:443: %w", domain, err)
 	}
@@ -100,9 +106,8 @@ func Connect(ctx context.Context, host, domain, path string, timeout time.Durati
 		ServerName:         domain,
 		InsecureSkipVerify: true,
 	}
-	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 
-	conn, err := tls.DialWithDialer(dialer, "tcp", host+":443", tlsConfig)
+	conn, err := dialTLS(ctx, host+":443", tlsConfig, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial to %s:443 (SNI=%s): %w", host, domain, err)
 	}
