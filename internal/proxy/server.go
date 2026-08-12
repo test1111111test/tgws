@@ -68,6 +68,11 @@ func (s *Server) IsRunning() bool {
 	return s.running
 }
 
+// canceled — гонка/запрос отменены извне: это НЕ ошибка маршрута
+func canceled(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
+}
+
 // === здоровье WS ===
 
 func (s *Server) wsOK() {
@@ -262,7 +267,8 @@ func (s *Server) acceptLoop(ctx context.Context, l net.Listener) {
 	}
 }
 
-// tryWSChain — последовательная WS-цепочка (primary → alt → via IP)
+// tryWSChain — последовательная WS-цепочка (primary → alt → via IP).
+// При отмене контекста (проигрыш в гонке) выходит тихо, без пометок ошибок.
 func (s *Server) tryWSChain(ctx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
 	for _, domain := range s.bal.Order(info.WSDomains) {
 		log.Printf("[%s] DC%d (test=%v) -> trying wss://%s%s (primary)",
@@ -274,6 +280,9 @@ func (s *Server) tryWSChain(ctx context.Context, info *HandshakeInfo, label stri
 			s.bal.MarkOK(domain)
 			s.wsOK()
 			return ws, "WebSocket"
+		}
+		if canceled(ctx, err) {
+			return nil, "" // гонка отменена — тихо выходим
 		}
 		stats.S.IncWSErr()
 		s.bal.MarkFail(domain)
@@ -294,6 +303,9 @@ func (s *Server) tryWSChain(ctx context.Context, info *HandshakeInfo, label stri
 				s.wsOK()
 				return ws, "WebSocket"
 			}
+			if canceled(ctx, err) {
+				return nil, ""
+			}
 			stats.S.IncWSErr()
 			s.bal.MarkFail(domain)
 			s.wsFail()
@@ -307,6 +319,9 @@ func (s *Server) tryWSChain(ctx context.Context, info *HandshakeInfo, label stri
 			log.Printf("[%s] ✓ WS connected via IP %s", label, info.TargetIP)
 			s.wsOK()
 			return ws, "WebSocket"
+		}
+		if canceled(ctx, err) {
+			return nil, ""
 		}
 		stats.S.IncWSErr()
 		s.wsFail()
@@ -376,7 +391,7 @@ func (s *Server) raceWSvsCF(ctx context.Context, info *HandshakeInfo, label stri
 	return transport, transportType
 }
 
-// tryCF пробует до 3 CF-доменов, возвращает транспорт или nil
+// tryCF пробует до 3 CF-доменов. Отмена контекста — не ошибка, worker не чернится.
 func (s *Server) tryCF(ctx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
 	dcIdx := info.DCInt
 	if info.IsMedia {
@@ -392,6 +407,9 @@ func (s *Server) tryCF(ctx context.Context, info *HandshakeInfo, label string) (
 
 		ws, err := websocket.ConnectDomain(ctx, domain, path, 10*time.Second)
 		if err != nil {
+			if canceled(ctx, err) {
+				return nil, "" // гонка отменена — worker НЕ черним
+			}
 			log.Printf("[%s] ✗ CF fallback failed on %s: %v", label, domain, err)
 			s.cf.MarkBad(domain)
 			stats.S.IncCFErr()
