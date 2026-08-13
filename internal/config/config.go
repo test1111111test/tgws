@@ -53,14 +53,14 @@ func DefaultConfig() *Config {
 		},
 		ForceTestDC:      false,
 		MaskDomain:       "www.google.com",
-		FakeTLSDomain:    "",
-		LogFile:          "",
+		FakeTLSDomain:    "www.google.com",
+		LogFile:          "tgws.log",
 		LogMaxSize:       10,
 		LogMaxFiles:      5,
 		LogToConsole:     true,
-		Verbose:          true,
+		Verbose:          false,
 		CFDomains:        "",
-		CFAutoUpdate:     true,
+		CFAutoUpdate:     false,
 		CFUpdateURL:      "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
 		CFUpdateInterval: 3600,
 		CFFirst:          false,
@@ -99,6 +99,7 @@ func (c *Config) LoadFromFile(filename string) error {
 	}
 	defer file.Close()
 
+	// Пропускаем UTF-8 BOM если есть
 	bom := make([]byte, 3)
 	n, err := file.Read(bom)
 	if err != nil && err != io.EOF {
@@ -231,12 +232,14 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString("# ========================================\n\n")
 
 	sb.WriteString("# Адрес для прослушивания\n")
+	sb.WriteString("# 127.0.0.1 - только локально; 0.0.0.0 - слушать снаружи\n")
 	sb.WriteString(fmt.Sprintf("host = %s\n\n", c.Host))
 
 	sb.WriteString("# Порт для прослушивания\n")
 	sb.WriteString(fmt.Sprintf("port = %d\n\n", c.Port))
 
 	sb.WriteString("# MTProto secret (32 hex символа)\n")
+	sb.WriteString("# Если пусто - будет сгенерирован автоматически\n")
 	sb.WriteString(fmt.Sprintf("secret = %s\n\n", c.Secret))
 
 	sb.WriteString("# Размер буфера сокета в байтах\n")
@@ -252,6 +255,7 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString(fmt.Sprintf("mask_domain = %s\n\n", c.MaskDomain))
 
 	sb.WriteString("# Домен для Fake TLS (ee-secret)\n")
+	sb.WriteString("# Если пусто - ee-secret и Fake TLS выключены\n")
 	sb.WriteString(fmt.Sprintf("fake_tls_domain = %s\n\n", c.FakeTLSDomain))
 
 	sb.WriteString("# ========================================\n")
@@ -271,7 +275,7 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString(fmt.Sprintf("log_to_console = %v\n\n", c.LogToConsole))
 
 	sb.WriteString("# Подробные пакетные логи (Splitter, дампы шифров)\n")
-	sb.WriteString("# Для продакшена ставь false — логи станут тихими\n")
+	sb.WriteString("# false = тихие логи (рекомендуется), true = для отладки\n")
 	sb.WriteString(fmt.Sprintf("verbose = %v\n\n", c.Verbose))
 
 	sb.WriteString("# ========================================\n")
@@ -279,9 +283,12 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString("# ========================================\n\n")
 
 	sb.WriteString("# Свои CF worker-домены, через запятую\n")
+	sb.WriteString("# Можно указывать с https:// и слэшами - приведётся к чистому домену\n")
 	sb.WriteString(fmt.Sprintf("cf_domains = %s\n\n", c.CFDomains))
 
-	sb.WriteString("# Автообновление списка CF доменов\n")
+	sb.WriteString("# Автообновление списка CF доменов с URL\n")
+	sb.WriteString("# false = использовать только cf_domains (рекомендуется,\n")
+	sb.WriteString("# внешний список часто содержит мёртвые домены)\n")
 	sb.WriteString(fmt.Sprintf("cf_auto_update = %v\n\n", c.CFAutoUpdate))
 
 	sb.WriteString("# URL списка доменов (текст, по домену в строке)\n")
@@ -291,6 +298,7 @@ func (c *Config) SaveToFile(filename string) error {
 	sb.WriteString(fmt.Sprintf("cf_update_interval = %d\n\n", c.CFUpdateInterval))
 
 	sb.WriteString("# Пробовать CF ПЕРВЫМ маршрутом (для заблокированных сетей)\n")
+	sb.WriteString("# false = гонка WS/CF и авто-детект мёртвого WS (рекомендуется)\n")
 	sb.WriteString(fmt.Sprintf("cf_first = %v\n\n", c.CFFirst))
 
 	sb.WriteString("# Редиректы DC (формат: DC:IP,DC:IP)\n")

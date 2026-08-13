@@ -391,18 +391,17 @@ func (s *Server) raceWSvsCF(ctx context.Context, info *HandshakeInfo, label stri
 	return transport, transportType
 }
 
-// tryCF пробует до 3 CF-доменов. Отмена контекста — не ошибка, worker не чернится.
+// tryCF пробует до 3 CF-доменов. Путь — официальный формат воркера: /apiws?dst=<IP>.
+// Отмена контекста — не ошибка, worker не чернится.
 func (s *Server) tryCF(ctx context.Context, info *HandshakeInfo, label string) (bridge.Transport, string) {
-	dcIdx := info.DCInt
-	if info.IsMedia {
-		dcIdx = -dcIdx
-	}
+	// Официальный воркер Flowseal принимает /apiws?dst=<DC IP> и трубит байты в raw TCP
+	path := "/apiws?dst=" + info.TargetIP
+
 	for attempt := 0; attempt < 3; attempt++ {
 		domain := s.cf.Next()
 		if domain == "" {
 			return nil, ""
 		}
-		path := cfproxy.CFPath(dcIdx)
 		log.Printf("[%s] DC%d -> trying CF fallback wss://%s%s", label, info.DC, domain, path)
 
 		ws, err := websocket.ConnectDomain(ctx, domain, path, 10*time.Second)
